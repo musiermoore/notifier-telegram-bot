@@ -40,6 +40,31 @@ type telegramUser struct {
 	Username *string `json:"username"`
 }
 
+type apiUser struct {
+	ID               string  `json:"id"`
+	Email            string  `json:"email"`
+	Name             string  `json:"name"`
+	Lang             string  `json:"lang"`
+	TelegramChat     *string `json:"telegram_chat,omitempty"`
+	TelegramUsername *string `json:"telegram_username,omitempty"`
+}
+
+type meResponse struct {
+	User apiUser `json:"user"`
+}
+
+type listItemsResponse struct {
+	User  apiUser           `json:"user"`
+	Items []telegramAPIItem `json:"items"`
+}
+
+type telegramAPIItem struct {
+	Title             string  `json:"title"`
+	Body              string  `json:"body"`
+	RemindAt          *string `json:"remind_at"`
+	DeliverToTelegram bool    `json:"deliver_to_telegram"`
+}
+
 type pendingDeliveriesResponse struct {
 	Deliveries []telegramDelivery `json:"deliveries"`
 }
@@ -154,20 +179,27 @@ func handleMessage(ctx context.Context, client *http.Client, cfg config.Config, 
 	if isStartCommand || code != "" {
 		if code == "" {
 			return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
-				"Open Notifier in the web app, generate a Telegram link code, then send /start YOUR_CODE here.")
+				"Открой Notifier в веб-интерфейсе, создай код привязки Telegram и отправь сюда /start ВАШ_КОД.")
 		}
 
 		if err := consumeLinkCode(ctx, client, cfg.APIBaseURL, code, message.Chat.ID, message.From); err != nil {
 			return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
-				"Linking failed. Check that the code is still valid and generate a new one in the Notifier web app.")
+				"Не удалось привязать аккаунт. Проверь, что код еще действует, и при необходимости создай новый в веб-интерфейсе Notifier.")
 		}
 
 		return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
-			"Telegram is now connected to your Notifier account. You can return to the web app and refresh the status.")
+			"Telegram теперь подключен к твоему аккаунту Notifier. Вернись в веб-интерфейс и обнови статус.")
+	}
+
+	switch strings.ToLower(strings.Fields(text)[0]) {
+	case "/me", "/me@oksananapominalabot":
+		return handleMeCommand(ctx, client, cfg, message)
+	case "/list", "/list@oksananapominalabot":
+		return handleListCommand(ctx, client, cfg, message)
 	}
 
 	return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
-		"Use /start YOUR_CODE or just send the code itself to connect this Telegram chat with your Notifier account.")
+		"Чтобы подключить этот Telegram-чат к Notifier, используй /start ВАШ_КОД или просто отправь сам код. Доступные команды: /me, /list.")
 }
 
 var hexCodePattern = regexp.MustCompile(`^[A-Fa-f0-9]{8}$`)
@@ -266,6 +298,52 @@ func sendMessageByChatID(ctx context.Context, client *http.Client, token, chatID
 	return nil
 }
 
+func handleMeCommand(ctx context.Context, client *http.Client, cfg config.Config, message telegramMessage) error {
+	user, err := fetchTelegramMe(ctx, client, cfg, message.Chat.ID)
+	if err != nil {
+		return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
+			"Этот Telegram пока не привязан к аккаунту Notifier. Создай код в веб-интерфейсе и отправь /start ВАШ_КОД.")
+	}
+
+	username := ""
+	if user.TelegramUsername != nil && strings.TrimSpace(*user.TelegramUsername) != "" {
+		username = "\nTelegram: @" + strings.TrimSpace(*user.TelegramUsername)
+	}
+
+	return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
+		fmt.Sprintf("Подключенный аккаунт:\nИмя: %s\nEmail: %s%s", user.Name, user.Email, username))
+}
+
+func handleListCommand(ctx context.Context, client *http.Client, cfg config.Config, message telegramMessage) error {
+	response, err := fetchTelegramItems(ctx, client, cfg, message.Chat.ID)
+	if err != nil {
+		return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
+			"Этот Telegram пока не привязан к аккаунту Notifier. Создай код в веб-интерфейсе и отправь /start ВАШ_КОД.")
+	}
+
+	if len(response.Items) == 0 {
+		return sendMessage(ctx, client, cfg.Token, message.Chat.ID,
+			"У тебя пока нет записей.")
+	}
+
+	lines := []string{"Последние записи:"}
+	for index, item := range response.Items {
+		line := fmt.Sprintf("%d. %s", index+1, item.Title)
+		if item.RemindAt != nil && strings.TrimSpace(*item.RemindAt) != "" {
+			line += fmt.Sprintf(" (напомнить в %s)", *item.RemindAt)
+		}
+		if item.DeliverToTelegram {
+			line += " [TG]"
+		}
+		lines = append(lines, line)
+		if strings.TrimSpace(item.Body) != "" {
+			lines = append(lines, "   "+item.Body)
+		}
+	}
+
+	return sendMessage(ctx, client, cfg.Token, message.Chat.ID, strings.Join(lines, "\n"))
+}
+
 func fetchPendingDeliveries(ctx context.Context, client *http.Client, cfg config.Config) ([]telegramDelivery, error) {
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -295,6 +373,68 @@ func fetchPendingDeliveries(ctx context.Context, client *http.Client, cfg config
 	}
 
 	return payload.Deliveries, nil
+}
+
+func fetchTelegramMe(ctx context.Context, client *http.Client, cfg config.Config, chatID int64) (apiUser, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		strings.TrimRight(cfg.APIBaseURL, "/")+"/v1/internal/telegram/me?chat_id="+url.QueryEscape(fmt.Sprintf("%d", chatID)),
+		nil,
+	)
+	if err != nil {
+		return apiUser{}, err
+	}
+	request.Header.Set("X-Service-Token", cfg.ServiceToken)
+
+	response, err := client.Do(request)
+	if err != nil {
+		return apiUser{}, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return apiUser{}, fmt.Errorf("telegram me status %d: %s", response.StatusCode, string(body))
+	}
+
+	var payload meResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return apiUser{}, err
+	}
+
+	return payload.User, nil
+}
+
+func fetchTelegramItems(ctx context.Context, client *http.Client, cfg config.Config, chatID int64) (listItemsResponse, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		strings.TrimRight(cfg.APIBaseURL, "/")+"/v1/internal/telegram/items?chat_id="+url.QueryEscape(fmt.Sprintf("%d", chatID)),
+		nil,
+	)
+	if err != nil {
+		return listItemsResponse{}, err
+	}
+	request.Header.Set("X-Service-Token", cfg.ServiceToken)
+
+	response, err := client.Do(request)
+	if err != nil {
+		return listItemsResponse{}, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return listItemsResponse{}, fmt.Errorf("telegram items status %d: %s", response.StatusCode, string(body))
+	}
+
+	var payload listItemsResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return listItemsResponse{}, err
+	}
+
+	return payload, nil
 }
 
 func markDeliveryComplete(ctx context.Context, client *http.Client, cfg config.Config, deliveryID string) error {
